@@ -1,10 +1,10 @@
-name: "Browser Sandbox (Chromium in Web Browser)"
+name: "Browser Sandbox (Cloudflare)"
 
 on:
   workflow_dispatch:
     inputs:
       duration_minutes:
-        description: "Duration to keep the sandbox alive (in minutes)"
+        description: "Duration to keep the sandbox alive (minutes)"
         required: true
         default: "60"
         type: choice
@@ -15,96 +15,143 @@ on:
           - "120"
           - "180"
           - "360"
-      tunnel_mode:
-        description: "How to connect"
+      browser_mode:
+        description: "Browser to launch"
         required: true
-        default: "quick_tunnel"
+        default: "custom_repo_dockerfile"
         type: choice
         options:
-          - "quick_tunnel"      # Instant free random URL (trycloudflare.com) - Zero setup needed!
-          - "custom_token"      # Uses your CLOUDFLARE_TUNNEL_TOKEN secret + your own domain
+          - "custom_repo_dockerfile"   # Uses this repo's Dockerfile (Alpine + Chromium + notes.html)
+          - "linuxserver_chromium"     # Uses prebuilt Chromium desktop container
+  push:
+    branches:
+      - main
 
 jobs:
-  browser-sandbox:
-    name: "Disposable Browser Sandbox"
+  sandbox:
+    name: "Run Sandbox Browser"
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
     steps:
-      - name: "Start Isolated Sandbox Browser (Docker)"
-        run: |
-          echo "Starting disposable Chromium sandbox container..."
-          docker run -d \
-            --name=browser-sandbox \
-            --security-opt seccomp=unconfined \
-            -e PUID=1000 \
-            -e PGID=1000 \
-            -e TZ=UTC \
-            -e CHROME_CLI=https://google.com \
-            -p 3000:3000 \
-            -v /dev/shm:/dev/shm \
-            --restart unless-stopped \
-            lscr.io/linuxserver/chromium:latest
+      - name: "Checkout code"
+        uses: actions/checkout@v4
 
-          echo "Waiting for browser container to become ready..."
-          until curl -s http://localhost:3000 > /dev/null; do
+      - name: "Start Sandbox Browser Container"
+        run: |
+          echo "::group::Starting Browser"
+          MODE="${{ github.event.inputs.browser_mode || 'custom_repo_dockerfile' }}"
+
+          if [ "$MODE" = "custom_repo_dockerfile" ] && [ -f "Dockerfile" ]; then
+            echo "Building custom Docker container from repo..."
+            docker build -t sandbox-browser .
+            docker run -d \
+              --name=browser-sandbox \
+              -p 8080:8080 \
+              --shm-size=1g \
+              --restart=unless-stopped \
+              sandbox-browser
+            PORT=8080
+          else
+            echo "Starting LinuxServer Chromium container..."
+            docker run -d \
+              --name=browser-sandbox \
+              --security-opt seccomp=unconfined \
+              -e PUID=1000 \
+              -e PGID=1000 \
+              -e TZ=UTC \
+              -e CHROME_CLI=https://google.com \
+              -p 8080:3000 \
+              -v /dev/shm:/dev/shm \
+              --restart=unless-stopped \
+              lscr.io/linuxserver/chromium:latest
+            PORT=8080
+          fi
+
+          echo "CONTAINER_PORT=$PORT" >> $GITHUB_ENV
+          echo "Waiting for browser UI to be ready on port $PORT..."
+          until curl -s "http://localhost:$PORT" > /dev/null; do
             sleep 2
           done
-          echo "✅ Sandbox browser is running locally on port 3000."
+          echo "✅ Sandbox browser is active on port $PORT."
+          echo "::endgroup::"
 
       - name: "Install cloudflared"
         run: |
+          echo "::group::Install cloudflared"
           curl -sL --output /tmp/cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i /tmp/cloudflared.deb
           rm -f /tmp/cloudflared.deb
+          echo "::endgroup::"
 
-      - name: "Expose via Cloudflare Tunnel"
+      - name: "Connect Cloudflare Tunnel & Generate Link"
         id: tunnel
         env:
-          TUNNEL_MODE: ${{ github.event.inputs.tunnel_mode || 'quick_tunnel' }}
           CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+          PORT: ${{ env.CONTAINER_PORT }}
         run: |
-          if [ "$TUNNEL_MODE" = "custom_token" ]; then
-            if [ -z "$CLOUDFLARE_TUNNEL_TOKEN" ]; then
-              echo "::error::CLOUDFLARE_TUNNEL_TOKEN secret is required when selecting 'custom_token' mode!"
-              exit 1
-            fi
-            echo "Starting Cloudflare Tunnel with your custom token..."
-            cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARE_TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
+          echo "::group::Cloudflare Connection"
+          
+          # If a permanent Tunnel Token is configured in GitHub Secrets, use it
+          if [ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]; then
+            echo "Starting Cloudflare Tunnel with permanent token..."
+            cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARE_TUNNEL_TOKEN" > /tmp/tunnel.log 2>&1 &
             sleep 4
-            echo "=========================================================="
-            echo "🚀 SANDBOX IS LIVE ON YOUR CUSTOM DOMAIN!"
-            echo "Point your Tunnel Hostname to Service: HTTP -> localhost:3000"
-            echo "=========================================================="
-          else
-            echo "Starting Cloudflare Quick Tunnel (Free, no account needed)..."
-            cloudflared tunnel --no-autoupdate --url http://localhost:3000 > /tmp/tunnel.log 2>&1 &
             
-            # Wait for Quick Tunnel URL to generate
-            echo "Generating public HTTPS URL..."
-            for i in {1..20}; do
-              URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" /tmp/tunnel.log | head -n 1 || true)
-              if [ -n "$URL" ]; then
+            ACCESS_URL="https://your-configured-domain (via your Cloudflare Tunnel)"
+            echo "PERMANENT_MODE=true" >> $GITHUB_ENV
+          else
+            echo "Starting instant Quick Tunnel (trycloudflare.com)..."
+            cloudflared tunnel --no-autoupdate --url "http://localhost:$PORT" > /tmp/tunnel.log 2>&1 &
+            
+            # Wait for public URL
+            for i in {1..25}; do
+              ACCESS_URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" /tmp/tunnel.log | head -n 1 || true)
+              if [ -n "$ACCESS_URL" ]; then
                 break
               fi
               sleep 2
             done
 
-            if [ -z "$URL" ]; then
-              echo "::error::Failed to retrieve Quick Tunnel URL. Log output:"
+            if [ -z "$ACCESS_URL" ]; then
+              echo "::error::Failed to retrieve tunnel URL. Tunnel logs:"
               cat /tmp/tunnel.log
               exit 1
             fi
-
-            echo "=========================================================="
-            echo "🎉 YOUR INSTANT SANDBOX BROWSER IS READY!"
-            echo ""
-            echo "👉 CLICK TO OPEN: $URL"
-            echo ""
-            echo "No client software, no passwords, no setup required."
-            echo "=========================================================="
-            echo "QUICK_URL=$URL" >> $GITHUB_ENV
+            echo "PERMANENT_MODE=false" >> $GITHUB_ENV
           fi
+
+          echo "ACCESS_URL=$ACCESS_URL" >> $GITHUB_ENV
+          echo "::endgroup::"
+
+          # 1. Output high-contrast banner in console logs
+          echo ""
+          echo "================================================================================"
+          echo "🎉 SANDBOX BROWSER IS ONLINE!"
+          echo ""
+          echo "👉 CLICK TO OPEN: $ACCESS_URL"
+          echo ""
+          echo "Runs 100% in GitHub Cloud | High-Speed Internet | Zero Local Load"
+          echo "================================================================================"
+          echo ""
+
+          # 2. Render directly on GitHub Actions Run Summary page
+          cat << EOF >> $GITHUB_STEP_SUMMARY
+          # 🚀 Sandbox Browser is Ready!
+
+          ### 🌐 Access Link:
+          ## [👉 Click Here to Open Your Sandbox Browser]($ACCESS_URL)
+
+          \`\`\`
+          $ACCESS_URL
+          \`\`\`
+
+          ---
+          - **Status**: 🟢 Online & Running
+          - **Duration**: ${{ github.event.inputs.duration_minutes || '60' }} minutes
+          - **Internet Access**: 10 Gbps Cloud Connection
+          - **Environment**: 100% Clean & Ephemeral (Wiped completely when stopped)
+          EOF
 
       - name: "Keep Sandbox Alive"
         run: |
@@ -112,20 +159,21 @@ jobs:
           TOTAL_SECONDS=$((MINUTES * 60))
           ELAPSED=0
 
-          echo "Sandbox running for $MINUTES minutes. Press 'Cancel workflow' in GitHub anytime to destroy it instantly."
-          
+          echo "Keeping sandbox session active for $MINUTES minutes..."
+          echo "To stop early, click 'Cancel workflow' in the GitHub UI."
+
           while [ $ELAPSED -lt $TOTAL_SECONDS ]; do
             sleep 30
             ELAPSED=$((ELAPSED + 30))
             REMAINING=$(( (TOTAL_SECONDS - ELAPSED) / 60 ))
-            
-            # Verify container is still running
+
+            # Health check
             if ! docker ps | grep -q browser-sandbox; then
               echo "::error::Sandbox container stopped!"
               exit 1
             fi
 
-            echo "[$(date +'%T')] 🟢 Sandbox active. Time left: ~$REMAINING min"
+            echo "[$(date +'%T')] 🟢 Sandbox active: ${{ env.ACCESS_URL }} | Remaining: ~$REMAINING min"
           done
 
           echo "Time limit reached. Disposing sandbox."
