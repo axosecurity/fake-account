@@ -1,0 +1,180 @@
+name: "Remote Desktop - Windows (VNC + Cloudflare Tunnel)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "Duration to keep the desktop session alive (in minutes)"
+        required: true
+        default: "60"
+        type: choice
+        options:
+          - "15"
+          - "30"
+          - "60"
+          - "120"
+          - "180"
+          - "360"
+  push:
+    branches:
+      - main
+
+jobs:
+  remote-desktop-windows:
+    name: "Windows Remote Desktop via Cloudflare"
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: "Validate Required Secrets"
+        shell: pwsh
+        run: |
+          if (-not $env:CLOUDFLARE_TUNNEL_TOKEN) {
+            Write-Error "CLOUDFLARE_TUNNEL_TOKEN secret is missing! Please configure it in GitHub Repository Settings -> Secrets and variables -> Actions."
+            exit 1
+          }
+          Write-Host "✅ CLOUDFLARE_TUNNEL_TOKEN is configured."
+        env:
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+
+      - name: "Install & Configure TightVNC Server"
+        shell: pwsh
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD || 'VncPass123!' }}
+        run: |
+          Write-Host "::group::Installing TightVNC"
+          choco install tightvnc -y --no-progress
+          $tvnPath = "C:\Program Files\TightVNC\tvnserver.exe"
+          if (-not (Test-Path $tvnPath)) {
+            Write-Error "TightVNC executable was not found at $tvnPath"
+            exit 1
+          }
+          Write-Host "TightVNC installed successfully."
+          Write-Host "::endgroup::"
+
+          Write-Host "::group::Configuring TightVNC Authentication"
+          # Standard VNC DES encryption key
+          $rfbKey = [byte[]](23, 82, 107, 6, 35, 78, 99, 65)
+          $plain = $env:VNC_PASSWORD
+          if ($plain.Length -gt 8) { $plain = $plain.Substring(0, 8) }
+          $plain = $plain.PadRight(8, "`0")
+          $passBytes = [System.Text.Encoding]::ASCII.GetBytes($plain)
+
+          # Reverse bit order for standard RFB password format
+          $reversedBytes = [byte[]]::new(8)
+          for ($i = 0; $i -lt 8; $i++) {
+            $b = $passBytes[$i]
+            $r = 0
+            for ($j = 0; $j -lt 8; $j++) {
+              if ($b -band (1 -shl $j)) { $r = $r -bor (1 -shl (7 - $j)) }
+            }
+            $reversedBytes[$i] = [byte]$r
+          }
+
+          # Encrypt with DES-ECB
+          $des = [System.Security.Cryptography.DES]::Create()
+          $des.Mode = [System.Security.Cryptography.CipherMode]::ECB
+          $des.Padding = [System.Security.Cryptography.PaddingMode]::None
+          $des.Key = $rfbKey
+          $encryptor = $des.CreateEncryptor()
+          $encPassword = $encryptor.TransformFinalBlock($reversedBytes, 0, 8)
+
+          # Apply settings to both HKLM and HKCU registry
+          $regPaths = @("HKLM:\SOFTWARE\TightVNC\Server", "HKCU:\Software\TightVNC\Server")
+          foreach ($path in $regPaths) {
+            if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
+            Set-ItemProperty -Path $path -Name "UseVncAuthentication" -Value 1 -Type DWord
+            Set-ItemProperty -Path $path -Name "Password" -Value $encPassword -Type Binary
+            Set-ItemProperty -Path $path -Name "ControlPassword" -Value $encPassword -Type Binary
+            Set-ItemProperty -Path $path -Name "RfbPort" -Value 5900 -Type DWord
+            Set-ItemProperty -Path $path -Name "HttpPort" -Value 5800 -Type DWord
+            Set-ItemProperty -Path $path -Name "AcceptHttpConnections" -Value 0 -Type DWord
+            Set-ItemProperty -Path $path -Name "DisconnectAction" -Value 0 -Type DWord
+            Set-ItemProperty -Path $path -Name "AcceptRfbConnections" -Value 1 -Type DWord
+          }
+          Write-Host "VNC password and registry configured."
+          Write-Host "::endgroup::"
+
+          Write-Host "::group::Starting TightVNC Server Process"
+          # Run in user session mode to interact with the desktop
+          $vncProc = Start-Process -FilePath $tvnPath -ArgumentList "-run" -PassThru -WindowStyle Hidden
+          Write-Host "TightVNC started with PID: $($vncProc.Id)"
+
+          # Wait up to 30 seconds for port 5900 to listen
+          $portReady = $false
+          for ($i = 0; $i -lt 15; $i++) {
+            Start-Sleep -Seconds 2
+            $conn = Test-NetConnection -ComputerName 127.0.0.1 -Port 5900 -WarningAction SilentlyContinue
+            if ($conn.TcpTestSucceeded) {
+              $portReady = $true
+              break
+            }
+          }
+
+          if (-not $portReady) {
+            Write-Error "TightVNC failed to start listening on 127.0.0.1:5900!"
+            exit 1
+          }
+          Write-Host "✅ TightVNC is listening on 127.0.0.1:5900"
+          Write-Host "::endgroup::"
+
+      - name: "Download & Run Cloudflare Tunnel (cloudflared)"
+        shell: pwsh
+        env:
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+        run: |
+          Write-Host "::group::Downloading cloudflared"
+          $cfUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+          Invoke-WebRequest -Uri $cfUrl -OutFile "cloudflared.exe" -UseBasicParsing
+          Write-Host "cloudflared downloaded."
+          Write-Host "::endgroup::"
+
+          Write-Host "::group::Launching Cloudflare Tunnel"
+          $tunnelArgs = "tunnel --no-autoupdate run --token $($env:CLOUDFLARE_TUNNEL_TOKEN)"
+          $cfProc = Start-Process -FilePath ".\cloudflared.exe" -ArgumentList $tunnelArgs -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 5
+
+          if ($cfProc.HasExited) {
+            Write-Error "cloudflared failed to start or terminated immediately! Check your CLOUDFLARE_TUNNEL_TOKEN."
+            exit 1
+          }
+          Write-Host "✅ Cloudflare Tunnel is running with PID: $($cfProc.Id)"
+          Write-Host "::endgroup::"
+
+      - name: "Remote Desktop Session Active (Keep-Alive)"
+        shell: pwsh
+        run: |
+          $inputDuration = "${{ github.event.inputs.duration_minutes }}"
+          $durationMin = if ([string]::IsNullOrWhiteSpace($inputDuration)) { 60 } else { [int]$inputDuration }
+          $totalSeconds = $durationMin * 60
+          $elapsed = 0
+
+          Write-Host "=========================================================="
+          Write-Host "🚀 REMOTE DESKTOP SESSION IS ONLINE!"
+          Write-Host "Session Duration: $durationMin minutes"
+          Write-Host "Port: 5900 (VNC)"
+          Write-Host "Protected by: Cloudflare Tunnel & Cloudflare Access"
+          Write-Host "=========================================================="
+
+          while ($elapsed -lt $totalSeconds) {
+            Start-Sleep -Seconds 30
+            $elapsed += 30
+            $remainingMin = [math]::Round(($totalSeconds - $elapsed) / 60, 1)
+
+            # Check if processes are still alive
+            $vncRunning = Get-Process -Name "tvnserver" -ErrorAction SilentlyContinue
+            $cfRunning = Get-Process -Name "cloudflared" -ErrorAction SilentlyContinue
+
+            if (-not $vncRunning) {
+              Write-Error "TightVNC process crashed or terminated!"
+              exit 1
+            }
+            if (-not $cfRunning) {
+              Write-Error "cloudflared process crashed or terminated!"
+              exit 1
+            }
+
+            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] 🟢 VNC & Tunnel healthy. Remaining: $remainingMin min"
+          }
+
+          Write-Host "Session duration completed. Tearing down runner."

@@ -1,0 +1,10 @@
+services:
+  browser:
+    build: .
+    container_name: alpine-chromium-gui
+    ports:
+      - "9999:8080"
+    volumes:
+      - ./notes.html:/root/notes.html:ro
+    shm_size: "1gb"
+    restart: unless-stopped

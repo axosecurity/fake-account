@@ -1,0 +1,150 @@
+name: "Remote Desktop - Ubuntu (TigerVNC + Cloudflare Tunnel)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "Duration to keep the desktop session alive (in minutes)"
+        required: true
+        default: "60"
+        type: choice
+        options:
+          - "15"
+          - "30"
+          - "60"
+          - "120"
+          - "180"
+          - "360"
+  push:
+    branches:
+      - main
+
+jobs:
+  remote-desktop-ubuntu:
+    name: "Ubuntu Remote Desktop via Cloudflare"
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: "Validate Required Secrets"
+        run: |
+          if [ -z "${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}" ]; then
+            echo "::error::CLOUDFLARE_TUNNEL_TOKEN secret is missing! Please configure it in GitHub Repository Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          echo "✅ CLOUDFLARE_TUNNEL_TOKEN is configured."
+
+      - name: "Install XFCE Desktop & TigerVNC"
+        run: |
+          echo "::group::Apt Packages Installation"
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            xfce4 \
+            xfce4-terminal \
+            tigervnc-standalone-server \
+            tigervnc-common \
+            dbus-x11 \
+            curl \
+            net-tools
+          echo "::endgroup::"
+
+      - name: "Configure & Start TigerVNC Server"
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD || 'VncPass123!' }}
+        run: |
+          echo "::group::VNC Configuration"
+          mkdir -p ~/.vnc
+
+          # Set VNC password securely
+          PASS="${VNC_PASSWORD:0:8}"
+          echo "$PASS" | vncpasswd -f > ~/.vnc/passwd
+          chmod 600 ~/.vnc/passwd
+
+          # Create xstartup file for XFCE desktop session
+          cat << 'EOF' > ~/.vnc/xstartup
+          #!/bin/bash
+          unset SESSION_MANAGER
+          unset DBUS_SESSION_BUS_ADDRESS
+          [ -x /etc/vnc/xstartup ] && exec /etc/vnc/xstartup
+          [ -r $HOME/.Xresources ] && xrdb $HOME/.Xresources
+          xsetroot -solid grey
+          vncconfig -iconic &
+          startxfce4 &
+          EOF
+          chmod +x ~/.vnc/xstartup
+          echo "::endgroup::"
+
+          echo "::group::Starting TigerVNC"
+          # Kill any lingering instance
+          vncserver -kill :1 2>/dev/null || true
+
+          # Start TigerVNC server on display :1 listening directly on port 5900
+          vncserver :1 -geometry 1920x1080 -depth 24 -rfbport 5900 -localhost no
+
+          # Verify port 5900 is listening
+          sleep 3
+          if ! nc -z 127.0.0.1 5900; then
+            echo "::error::TigerVNC failed to start on 127.0.0.1:5900"
+            exit 1
+          fi
+          echo "✅ TigerVNC is active on 127.0.0.1:5900"
+          echo "::endgroup::"
+
+      - name: "Install & Run Cloudflare Tunnel (cloudflared)"
+        env:
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+        run: |
+          echo "::group::Install cloudflared"
+          curl -sL --output /tmp/cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i /tmp/cloudflared.deb
+          rm -f /tmp/cloudflared.deb
+          echo "cloudflared installed version: $(cloudflared --version)"
+          echo "::endgroup::"
+
+          echo "::group::Launch Cloudflare Tunnel"
+          cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARE_TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
+          CF_PID=$!
+          echo "Cloudflare Tunnel started with PID: $CF_PID"
+
+          sleep 5
+          if ! ps -p $CF_PID > /dev/null; then
+            echo "::error::cloudflared exited immediately. Log output:"
+            cat /tmp/cloudflared.log
+            exit 1
+          fi
+          echo "✅ Cloudflare Tunnel is connected and operational."
+          echo "::endgroup::"
+
+      - name: "Remote Desktop Session Active (Keep-Alive)"
+        run: |
+          MINUTES="${{ github.event.inputs.duration_minutes || '60' }}"
+          TOTAL_SECONDS=$((MINUTES * 60))
+          ELAPSED=0
+
+          echo "=========================================================="
+          echo "🚀 UBUNTU REMOTE DESKTOP SESSION IS ONLINE!"
+          echo "Session Duration: $MINUTES minutes"
+          echo "Resolution: 1920x1080 (XFCE4)"
+          echo "Port: 5900 (VNC)"
+          echo "Protected by: Cloudflare Tunnel & Cloudflare Access"
+          echo "=========================================================="
+
+          while [ $ELAPSED -lt $TOTAL_SECONDS ]; do
+            sleep 30
+            ELAPSED=$((ELAPSED + 30))
+            REMAINING=$(( (TOTAL_SECONDS - ELAPSED) / 60 ))
+
+            # Health check on background processes
+            if ! pgrep -f "Xtigervnc" > /dev/null; then
+              echo "::error::TigerVNC process crashed!"
+              exit 1
+            fi
+            if ! pgrep -f "cloudflared" > /dev/null; then
+              echo "::error::cloudflared process crashed!"
+              exit 1
+            fi
+
+            echo "[$(date +'%Y-%m-%d %H:%M:%S')] 🟢 VNC & Tunnel healthy. Remaining: ~$REMAINING min"
+          done
+
+          echo "Session duration completed. Tearing down runner."
